@@ -19,7 +19,7 @@ from app.db import (
     ensure_user,
     add_balance_rub,
 )
-from app.services import lolz  # build_pay_url / find_payment_by_comment / extract_success_operation / extract_any_success_amount
+from app.services import lolz  # build_pay_url / find_payment_by_comment / extract_success_operation
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -121,11 +121,35 @@ async def msg_balance_deposit(message: Message, state: FSMContext):
         logger.exception("text deposit fallback failed")
 
 
+# === ВАЖНО: сбрасываем стейт, если пользователь ушёл в другой раздел ===
+_ALLOWED_PREFIXES = ("balance:deposit", "deposit:", "pay:")
+
+@router.callback_query(DepositStates.waiting_amount)
+async def clear_waiting_on_foreign_callback(cb: CallbackQuery, state: FSMContext):
+    data = (cb.data or "")
+    if data.startswith(_ALLOWED_PREFIXES):
+        return  # наши кнопки — не трогаем
+    await state.clear()
+    return  # позволяем другим хендлерам обработать этот callback
+
+@router.callback_query(DepositStates.choosing_method)
+async def clear_choosing_on_foreign_callback(cb: CallbackQuery, state: FSMContext):
+    data = (cb.data or "")
+    if data.startswith(_ALLOWED_PREFIXES):
+        return
+    await state.clear()
+    return
+
+
 # === ввод суммы (целые рубли, минимум 100) ===
-@router.message(DepositStates.waiting_amount)
+# Обрабатываем ТОЛЬКО то, что похоже на число (разрешаем "1 000", "1,000", "1_000")
+@router.message(DepositStates.waiting_amount, F.text.regexp(r"^[\d\s,._]+$"))
 async def deposit_amount_entered(message: Message, state: FSMContext):
+    raw = (message.text or "").strip()
+    numerish = re.sub(r"[ \t,._]", "", raw)
+
     try:
-        amount = int(message.text.strip())
+        amount = int(numerish)
         if amount <= 0:
             raise ValueError
     except Exception:
@@ -254,6 +278,7 @@ async def cb_pay_check(cq: CallbackQuery, state: FSMContext):
             )
             await state.clear()
             await cq.answer("Оплата подтверждена")
+            # Можно оставить edit_text; если хочешь — замени на новое сообщение
             await cq.message.edit_text(
                 f"✅ Пополнение успешно\n"
                 f"Сумма: <b>{amount} ₽</b>\n"
@@ -263,9 +288,14 @@ async def cb_pay_check(cq: CallbackQuery, state: FSMContext):
             )
             return
 
-        # если не оплачено и время истекло — убираем URL
+        # если не оплачено и время истекло — НЕ редактируем старое сообщение,
+        # снимаем с него клавиатуру и шлём НОВОЕ сообщение.
         if expired:
-            await cq.message.edit_text(
+            try:
+                await cq.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            await cq.message.answer(
                 "⛔️ <b>Время сессии истекло.</b>\n"
                 "Создайте новый платёж, нажав «Пополнить», и повторите попытку.",
                 reply_markup=expired_invoice_kb()
